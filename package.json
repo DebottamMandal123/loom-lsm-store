@@ -1,0 +1,23 @@
+{
+  "name": "loom-lsm-store",
+  "version": "1.0.0",
+  "description": "A dependency-free LSM-tree key-value storage engine in Node.js/TypeScript.",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "bin": {
+    "loom": "dist/cli.js"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "demo": "node dist/cli.js demo .loom-demo",
+    "bench": "node scripts/benchmark.js 5000 .loom-bench"
+  },
+  "keywords": [
+    "lsm-tree",
+    "sstable",
+    "wal",
+    "bloom-filter",
+    "storage-engine"
+  ],
+  "license": "MIT"
+}
