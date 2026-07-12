@@ -47,6 +47,8 @@ async function main(argv) {
       console.log("ok");
     } else if (command === "stats") {
       console.log(JSON.stringify(store.stats(), null, 2));
+    } else if (command === "verify") {
+      console.log(JSON.stringify(await store.verify(), null, 2));
     } else if (command === "scan") {
       const rows = await store.scan({ start: key, end: rawValue, limit: extra ? Number(extra) : undefined });
       console.log(JSON.stringify(rows, null, 2));
@@ -78,6 +80,7 @@ Usage:
   loom scan <dir> [startKey] [endKey] [limit]
   loom flush <dir>
   loom compact <dir>
+  loom verify <dir>
   loom stats <dir>`);
 }
 

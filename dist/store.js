@@ -3,11 +3,13 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const { checksum32 } = require("./checksum");
-const { appendAndSync, atomicWriteFile, truncateAndSync } = require("./io");
+const { appendAndSync, atomicWriteFile, truncateAndSync, truncateToAndSync } = require("./io");
+const { compareKeys } = require("./key-order");
 const { findInSstable, readEntries, scanSstable, writeSstable } = require("./sstable");
 
 const DEFAULT_OPTIONS = {
   memtableLimit: 100,
+  memtableBytesLimit: 4 * 1024 * 1024,
   level0CompactionThreshold: 4,
   levelMaxTables: 6,
   blockSize: 16,
@@ -19,28 +21,40 @@ class LoomStore {
     this.dir = dir;
     this.walPath = path.join(dir, "wal.log");
     this.manifestPath = path.join(dir, "MANIFEST.json");
+    this.lockPath = path.join(dir, "LOCK");
     this.options = { ...DEFAULT_OPTIONS, ...options };
-    this.manifest = { version: 2, nextFileId: 1, nextSeq: 1, levels: [[]] };
+    validateOptions(this.options);
+    this.manifest = { version: 3, nextFileId: 1, nextSeq: 1, levels: [[]] };
     this.memtable = new Map();
+    this.memtableBytes = 0;
     this.writeQueue = Promise.resolve();
+    this.lockHandle = undefined;
     this.closed = false;
   }
 
   static async open(dir, options = {}) {
     const store = new LoomStore(dir, options);
     await fs.mkdir(dir, { recursive: true });
-    await store.loadManifest();
-    await store.recoverWal();
-    return store;
+    await store.acquireLock();
+    try {
+      await store.loadManifest();
+      await store.cleanupOrphans();
+      await store.recoverWal();
+      return store;
+    } catch (error) {
+      await store.releaseLock();
+      throw error;
+    }
   }
 
   async put(key, value) {
     this.assertKey(key);
+    const storedValue = cloneStoredValue(value);
     await this.enqueueWrite(async () => {
       this.assertOpen();
       const seq = this.manifest.nextSeq++;
-      await this.appendWal({ op: "put", key, value, seq });
-      this.memtable.set(key, { key, value, seq, deleted: false });
+      await this.appendWal({ op: "put", key, value: storedValue, seq });
+      this.setMemtableEntry({ key, value: storedValue, seq, deleted: false });
       await this.flushIfNeeded();
     });
   }
@@ -48,6 +62,7 @@ class LoomStore {
   async get(key) {
     this.assertKey(key);
     await this.writeQueue;
+    this.assertOpen();
     const entry = await this.findLatestEntry(key);
     return !entry || entry.deleted ? undefined : entry.value;
   }
@@ -58,13 +73,15 @@ class LoomStore {
       this.assertOpen();
       const seq = this.manifest.nextSeq++;
       await this.appendWal({ op: "delete", key, seq });
-      this.memtable.set(key, { key, seq, deleted: true });
+      this.setMemtableEntry({ key, seq, deleted: true });
       await this.flushIfNeeded();
     });
   }
 
   async scan(options = {}) {
     await this.writeQueue;
+    this.assertOpen();
+    validateScanOptions(options);
     const merged = new Map();
     const consider = (entry) => {
       if (!inRange(entry.key, options.start, options.end)) return;
@@ -79,7 +96,7 @@ class LoomStore {
 
     const rows = [...merged.values()]
       .filter((entry) => !entry.deleted)
-      .sort((a, b) => a.key.localeCompare(b.key))
+      .sort((a, b) => compareKeys(a.key, b.key))
       .map((entry) => ({ key: entry.key, value: entry.value }));
     return options.limit ? rows.slice(0, options.limit) : rows;
   }
@@ -112,19 +129,55 @@ class LoomStore {
     });
     return {
       memtableEntries: this.memtable.size,
+      memtableBytes: this.memtableBytes,
       sstables: this.allTables().length,
       diskEntries: this.allTables().reduce((sum, table) => sum + table.count, 0),
+      diskBytes: this.allTables().reduce((sum, table) => sum + table.sizeBytes, 0),
       nextFileId: this.manifest.nextFileId,
       nextSeq: this.manifest.nextSeq,
       levels,
     };
   }
 
-  async close() {
+  async verify() {
+    await this.writeQueue;
+    this.assertOpen();
+    let entries = 0;
+    for (const table of this.allTables()) {
+      const rows = await readEntries(this.dir, table);
+      if (rows.length !== table.count) throw new Error(`${table.file} entry count does not match its manifest metadata`);
+      for (let index = 0; index < rows.length; index += 1) {
+        const entry = rows[index];
+        if (index > 0 && compareKeys(rows[index - 1].key, entry.key) >= 0) {
+          throw new Error(`${table.file} entries are not strictly sorted`);
+        }
+        if (compareKeys(entry.key, table.minKey) < 0 || compareKeys(entry.key, table.maxKey) > 0) {
+          throw new Error(`${table.file} contains a key outside its manifest range`);
+        }
+        if (entry.seq < table.minSeq || entry.seq > table.maxSeq) {
+          throw new Error(`${table.file} contains a sequence outside its manifest range`);
+        }
+      }
+      entries += rows.length;
+    }
+    return {
+      ok: true,
+      tables: this.allTables().length,
+      entries,
+      bytes: this.allTables().reduce((sum, table) => sum + table.sizeBytes, 0),
+      levels: this.manifest.levels.length,
+    };
+  }
+
+  async close(options = {}) {
     await this.enqueueWrite(async () => {
       if (!this.closed) {
-        await this.flushMemtable();
-        this.closed = true;
+        try {
+          if (options.flush !== false) await this.flushMemtable();
+        } finally {
+          this.closed = true;
+          await this.releaseLock();
+        }
       }
     });
   }
@@ -148,6 +201,7 @@ class LoomStore {
     await this.saveManifest();
     await truncateAndSync(this.walPath);
     this.memtable.clear();
+    this.memtableBytes = 0;
     await this.compactIfNeeded();
   }
 
@@ -215,7 +269,7 @@ class LoomStore {
     }
     return [...merged.values()]
       .filter((entry) => !(dropTombstones && entry.deleted))
-      .sort((a, b) => a.key.localeCompare(b.key));
+      .sort((a, b) => compareKeys(a.key, b.key));
   }
 
   async removeTables(tables) {
@@ -225,28 +279,44 @@ class LoomStore {
   async loadManifest() {
     try {
       const parsed = JSON.parse(await fs.readFile(this.manifestPath, "utf8"));
-      if (parsed.version === 2 && Array.isArray(parsed.levels)) {
+      if (parsed.version === 3 && Array.isArray(parsed.levels)) {
         this.manifest = parsed;
-      } else {
+      } else if (parsed.version === 2 && Array.isArray(parsed.levels)) {
         this.manifest = {
-          version: 2,
-          nextFileId: parsed.nextId ?? 1,
-          nextSeq: 1,
-          levels: [parsed.tables ?? []],
+          version: 3,
+          nextFileId: parsed.nextFileId,
+          nextSeq: parsed.nextSeq,
+          levels: parsed.levels,
         };
+      } else {
+        throw new Error(`unsupported manifest version: ${String(parsed.version ?? "unknown")}`);
       }
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
       await this.saveManifest();
     }
     if (this.manifest.levels.length === 0) this.manifest.levels = [[]];
+    validateManifest(this.manifest);
   }
 
   async recoverWal() {
     try {
-      const content = await fs.readFile(this.walPath, "utf8");
-      for (const line of content.split(/\r?\n/)) {
-        if (!line.trim()) continue;
+      const content = await fs.readFile(this.walPath);
+      const durableSeq = this.allTables().reduce((max, table) => Math.max(max, table.maxSeq), 0);
+      let cursor = 0;
+      let validLength = 0;
+      let replayed = false;
+      while (cursor < content.length) {
+        const newline = content.indexOf(0x0a, cursor);
+        if (newline === -1) break;
+        let lineBuffer = content.subarray(cursor, newline);
+        if (lineBuffer.at(-1) === 0x0d) lineBuffer = lineBuffer.subarray(0, -1);
+        const line = lineBuffer.toString("utf8");
+        if (!line.trim()) {
+          validLength = newline + 1;
+          cursor = newline + 1;
+          continue;
+        }
         let parsed;
         try {
           parsed = JSON.parse(line);
@@ -256,9 +326,10 @@ class LoomStore {
         const body = JSON.stringify(parsed.record);
         if (checksum32(body) !== parsed.checksum) break;
         const record = parsed.record;
-        const current = this.memtable.get(record.key);
-        if (!current || record.seq >= current.seq) {
-          this.memtable.set(record.key, {
+        if (record.seq > durableSeq) {
+          replayed = true;
+          const current = this.memtable.get(record.key);
+          if (!current || record.seq >= current.seq) this.setMemtableEntry({
             key: record.key,
             value: record.value,
             seq: record.seq,
@@ -266,7 +337,11 @@ class LoomStore {
           });
         }
         this.manifest.nextSeq = Math.max(this.manifest.nextSeq, record.seq + 1);
+        validLength = newline + 1;
+        cursor = newline + 1;
       }
+      if (content.length > 0 && !replayed) await truncateAndSync(this.walPath);
+      else if (validLength < content.length) await truncateToAndSync(this.walPath, validLength);
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
       await truncateAndSync(this.walPath);
@@ -284,7 +359,61 @@ class LoomStore {
   }
 
   async flushIfNeeded() {
-    if (this.memtable.size >= this.options.memtableLimit) await this.flushMemtable();
+    if (
+      this.memtable.size >= this.options.memtableLimit ||
+      this.memtableBytes >= this.options.memtableBytesLimit
+    ) await this.flushMemtable();
+  }
+
+  setMemtableEntry(entry) {
+    const previous = this.memtable.get(entry.key);
+    if (previous) this.memtableBytes -= entrySize(previous);
+    this.memtable.set(entry.key, entry);
+    this.memtableBytes += entrySize(entry);
+  }
+
+  async acquireLock() {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const handle = await fs.open(this.lockPath, "wx");
+        await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }), "utf8");
+        await handle.sync();
+        this.lockHandle = handle;
+        return;
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+        if (attempt === 1 || !(await this.lockIsStale())) throw new Error(`store is already open: ${this.dir}`);
+        await fs.rm(this.lockPath, { force: true });
+      }
+    }
+  }
+
+  async lockIsStale() {
+    try {
+      const lock = JSON.parse(await fs.readFile(this.lockPath, "utf8"));
+      return !Number.isInteger(lock.pid) || !processIsAlive(lock.pid);
+    } catch {
+      return true;
+    }
+  }
+
+  async releaseLock() {
+    const handle = this.lockHandle;
+    this.lockHandle = undefined;
+    if (handle) await handle.close();
+    await fs.rm(this.lockPath, { force: true });
+  }
+
+  async cleanupOrphans() {
+    const active = new Set(this.allTables().map((table) => table.file));
+    for (const entry of await fs.readdir(this.dir, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const isSstable = /^sst-\d+\.(?:json|sst)$/.test(entry.name);
+      const isTemp = entry.name.includes(".tmp-");
+      if ((isSstable && !active.has(entry.name)) || isTemp) {
+        await fs.rm(path.join(this.dir, entry.name), { force: true });
+      }
+    }
   }
 
   allTables() {
@@ -319,7 +448,7 @@ function rangesOverlap(aMin, aMax, bMin, bMax) {
 }
 
 function sortTables(tables) {
-  return [...tables].sort((a, b) => a.minKey.localeCompare(b.minKey));
+  return [...tables].sort((a, b) => compareKeys(a.minKey, b.minKey));
 }
 
 function minString(values) {
@@ -328,6 +457,82 @@ function minString(values) {
 
 function maxString(values) {
   return values.length ? values.reduce((max, value) => (value > max ? value : max)) : undefined;
+}
+
+function validateOptions(options) {
+  for (const [name, value] of Object.entries(options)) {
+    if (name === "syncWrites") continue;
+    if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+  }
+  if (typeof options.syncWrites !== "boolean") throw new Error("syncWrites must be a boolean");
+}
+
+function validateScanOptions(options) {
+  if (options.start !== undefined && (typeof options.start !== "string" || options.start.length === 0)) {
+    throw new Error("scan start must be a non-empty string");
+  }
+  if (options.end !== undefined && (typeof options.end !== "string" || options.end.length === 0)) {
+    throw new Error("scan end must be a non-empty string");
+  }
+  if (options.start && options.end && compareKeys(options.start, options.end) > 0) {
+    throw new Error("scan start must not be greater than end");
+  }
+  if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit <= 0)) {
+    throw new Error("scan limit must be a positive integer");
+  }
+}
+
+function validateManifest(manifest) {
+  if (!Number.isSafeInteger(manifest.nextFileId) || manifest.nextFileId <= 0) {
+    throw new Error("manifest has an invalid nextFileId");
+  }
+  if (!Number.isSafeInteger(manifest.nextSeq) || manifest.nextSeq <= 0) {
+    throw new Error("manifest has an invalid nextSeq");
+  }
+  if (!Array.isArray(manifest.levels)) throw new Error("manifest levels must be an array");
+  for (const [level, tables] of manifest.levels.entries()) {
+    if (!Array.isArray(tables)) throw new Error(`manifest level ${level} must be an array`);
+    for (const table of tables) {
+      if (!/^sst-\d+\.(?:json|sst)$/.test(table.file)) throw new Error(`invalid SSTable filename: ${table.file}`);
+      if (table.level !== level) throw new Error(`SSTable ${table.file} is assigned to the wrong level`);
+      if (compareKeys(table.minKey, table.maxKey) > 0) throw new Error(`SSTable ${table.file} has an invalid key range`);
+    }
+  }
+}
+
+function cloneStoredValue(value) {
+  validateStoredValue(value, new Set());
+  return JSON.parse(JSON.stringify(value));
+}
+
+function validateStoredValue(value, ancestors) {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("stored numbers must be finite");
+    return;
+  }
+  if (typeof value !== "object") throw new Error("value must be JSON-serializable");
+  if (ancestors.has(value)) throw new Error("value must not contain circular references");
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) {
+    throw new Error("stored objects must be plain objects");
+  }
+  ancestors.add(value);
+  for (const nested of Array.isArray(value) ? value : Object.values(value)) validateStoredValue(nested, ancestors);
+  ancestors.delete(value);
+}
+
+function entrySize(entry) {
+  return Buffer.byteLength(JSON.stringify(entry), "utf8");
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
 }
 
 module.exports = { LoomStore };

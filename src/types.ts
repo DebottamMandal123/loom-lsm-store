@@ -41,7 +41,7 @@ export interface SstableMeta {
 }
 
 export interface Manifest {
-  version: 2;
+  version: 3;
   nextFileId: number;
   nextSeq: number;
   levels: SstableMeta[][];
@@ -49,10 +49,15 @@ export interface Manifest {
 
 export interface StoreOptions {
   memtableLimit?: number;
+  memtableBytesLimit?: number;
   level0CompactionThreshold?: number;
   levelMaxTables?: number;
   blockSize?: number;
   syncWrites?: boolean;
+}
+
+export interface CloseOptions {
+  flush?: boolean;
 }
 
 export interface ScanOptions {
@@ -63,8 +68,10 @@ export interface ScanOptions {
 
 export interface StoreStats {
   memtableEntries: number;
+  memtableBytes: number;
   sstables: number;
   diskEntries: number;
+  diskBytes: number;
   nextFileId: number;
   nextSeq: number;
   levels: Array<{
@@ -73,4 +80,12 @@ export interface StoreStats {
     entries: number;
     keyRange: [string, string] | null;
   }>;
+}
+
+export interface StoreVerification {
+  ok: true;
+  tables: number;
+  entries: number;
+  bytes: number;
+  levels: number;
 }

@@ -28,9 +28,13 @@ async function appendAndSync(file, data, sync) {
 }
 
 async function truncateAndSync(file) {
-  const handle = await fs.open(file, "w");
+  await truncateToAndSync(file, 0);
+}
+
+async function truncateToAndSync(file, length) {
+  const handle = await fs.open(file, length === 0 ? "w" : "r+");
   try {
-    await handle.truncate(0);
+    await handle.truncate(length);
     await handle.sync();
   } finally {
     await handle.close();
@@ -50,4 +54,4 @@ async function fsyncParent(file) {
   }
 }
 
-module.exports = { atomicWriteFile, appendAndSync, truncateAndSync, fsyncParent };
+module.exports = { atomicWriteFile, appendAndSync, truncateAndSync, truncateToAndSync, fsyncParent };

@@ -26,9 +26,13 @@ export async function appendAndSync(file: string, data: string, sync: boolean): 
 }
 
 export async function truncateAndSync(file: string): Promise<void> {
-  const handle = await fs.open(file, "w");
+  await truncateToAndSync(file, 0);
+}
+
+export async function truncateToAndSync(file: string, length: number): Promise<void> {
+  const handle = await fs.open(file, length === 0 ? "w" : "r+");
   try {
-    await handle.truncate(0);
+    await handle.truncate(length);
     await handle.sync();
   } finally {
     await handle.close();
